@@ -8,10 +8,6 @@ _mps_lock = threading.RLock()
 
 @contextlib.contextmanager
 def mps_safe(device=None):
-    """
-    Thread-safe context manager for Apple Silicon MPS operations to ensure synchronized,
-    race-condition-free tensor computations with atomic execution boundaries and device synchronization.
-    """
     is_mps = False
     if device is not None:
         if isinstance(device, str):

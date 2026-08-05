@@ -33,11 +33,6 @@ import safetensors.numpy as st
 _camera_calib_cache = None
 
 def _load_camera_calibration() -> Dict[str, float]:
-    """
-    Dynamically loads intrinsic camera calibration priors from an external JSON configuration file.
-    Provides a fallback to standard 320x240 defaults if the file is missing or malformed,
-    eliminating hard-coded spatial projection values from the source codebase.
-    """
     global _camera_calib_cache
     if _camera_calib_cache is not None:
         return _camera_calib_cache
@@ -75,12 +70,6 @@ class DisplayMode(str, Enum):
     DETAILEDGUI = "detailedgui"
 
 def _get_stable_compute_device() -> str:
-    """
-    Dynamically routes hardware targeting. Now explicitly supports Apple Silicon MPS
-    for accelerated tensor operations while defaulting to CUDA if available.
-    """
-    # CRITICAL FIX: Enable Apple Silicon MPS CPU fallback to prevent driver crashes during unsupported op delegation
-    # This mitigates secondary crashes during async handoffs to CPU fallback on Apple Silicon
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     
     if torch.cuda.is_available():
@@ -96,11 +85,6 @@ class PerformanceMode(str, Enum):
     HIGH = "high"
     
 def _load_dynamic_object_scales() -> Dict[str, float]:
-    """
-    Dynamically loads object scale priors from an external JSON configuration file.
-    Provides a fallback to default values if the file is missing or malformed,
-    eliminating hard-coded scale values from the source codebase.
-    """
     config_path = os.environ.get("LEPAUTE_OBJECT_CONFIG_PATH", "object_config.json")
     default_scales = {
         "table": 1.5, 
@@ -128,29 +112,21 @@ def _load_dynamic_object_scales() -> Dict[str, float]:
     return default_scales
 
 def _load_dynamic_object_names() -> List[str]:
-    """
-    Dynamically derives the list of detectable object names directly from 
-    the loaded dynamic scale configuration keys.
-    """
     return list(_load_dynamic_object_scales().keys())
     
 class LepauteConfig(BaseSettings):
     device: str = Field(default_factory=_get_stable_compute_device)
     data_store: str = "lepaute_data.db"
-    
-    # Performance profile orchestration flag
+
     performance_mode: PerformanceMode = PerformanceMode.MEDIUM
     
-    # YOLO zero-shot classification target labels (Dynamically loaded)
     object_names: List[str] = Field(default_factory=_load_dynamic_object_names)
     
-    # Scale priors (in meters) for monocular Z-depth projection (Dynamically loaded)
     object_scales: Dict[str, float] = Field(default_factory=_load_dynamic_object_scales)
     
     orig_h: int = 240
     orig_w: int = 320
     
-    # Dynamically loaded camera intrinsics replacing hardcoded values
     fx: float = Field(default_factory=_get_fx)
     fy: float = Field(default_factory=_get_fy)
     cx: float = Field(default_factory=_get_cx)
@@ -161,7 +137,6 @@ class LepauteConfig(BaseSettings):
     use_compiler: bool = False
     enable_orb_fallback: bool = True
     
-    # Explicit dataloader control preventing deadlocks on constrained compute interfaces (MPS/Windows)
     num_workers: Optional[int] = None
     
 class CameraIOStream:
@@ -193,8 +168,6 @@ class CameraIOStream:
             if self.cap and self.cap.isOpened():
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
-                    # Execute heavy resizing workload inside the background thread to free up the main loop
-                    # FIX: OpenCV defaults to BGR. Explicitly convert to RGB to fix the channel inversion issue.
                     bgr = cv2.resize(frame, (self.config.orig_w, self.config.orig_h))
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     with self.frame_lock:
@@ -267,13 +240,11 @@ class CameraIOStream:
             with self.frame_lock:
                 if self.latest_frame is not None:
                     frame_to_return = self.latest_frame.copy()
-                # Acknowledge and reset the stream interruption flag only upon successful frame acquisition
                 if self.stream_interrupted and frame_to_return is not None:
                     self.stream_interrupted = False
                     self.reconnect_count += 1
                     restored = True
             
-            # Prevent startup race condition where the thread hasn't fetched the first frame yet
             if frame_to_return is None:
                 logger.warning(f"[CameraIOStream] Frame buffer empty for ID: {self.frame_id}. Waiting for background thread...")
                 for _ in range(20):
@@ -364,7 +335,6 @@ class SequenceDataCollector(threading.Thread):
                     logger.debug(f"[SequenceDataCollector] Processing persistence batch of size {len(batch)}...")
                     records = []
                     for (img_a, img_b, xi, obj_name) in batch:
-                        # Stored safely as RGB uint8 (original depth) to eliminate precision loss and color risk from float16 + BGR 
                         img_a_safe = np.ascontiguousarray(img_a, dtype=np.uint8)
                         img_b_safe = np.ascontiguousarray(img_b, dtype=np.uint8)
                         
@@ -407,7 +377,6 @@ class SequenceDataCollector(threading.Thread):
             
         logger.info("[SequenceDataCollector] Executing final SQLite WAL checkpoint truncation...")
         try:
-            # CRITICAL FIX: Added explicit timeout to prevent infinite hang if the database is externally locked
             with sqlite3.connect(self.db_path, timeout=2.0) as conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 conn.commit()
@@ -426,14 +395,11 @@ def load_data(config: LepauteConfig) -> List[Dict]:
                     img_b = st.load(row[1])["img"].astype(np.uint8)
                 except Exception:
                     try:
-                        # Fallback for np.save/BytesIO serialization
                         img_a = np.load(io.BytesIO(row[0])).astype(np.uint8)
                         img_b = np.load(io.BytesIO(row[1])).astype(np.uint8)
                     except Exception:
-                        # Fallback for deprecated jpeg string formats
                         img_a = cv2.imdecode(np.frombuffer(row[0], np.uint8), cv2.IMREAD_COLOR)
                         img_b = cv2.imdecode(np.frombuffer(row[1], np.uint8), cv2.IMREAD_COLOR)
-                        # Correct color space for legacy payload fallbacks
                         if img_a is not None: img_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2RGB)
                         if img_b is not None: img_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2RGB)
 
@@ -449,7 +415,6 @@ def load_data(config: LepauteConfig) -> List[Dict]:
 def _cached_read_image(path: str) -> np.ndarray:
     img = cv2.imread(path)
     if img is None:
-        # Prevent cryptic OpenCV C++ assertion failures by throwing a clear Python exception
         raise FileNotFoundError(
             f"[Dataset IO Error] CRITICAL: OpenCV failed to load image at '{path}'. "
             f"Please verify that the 'jpg' directory contains this file and it is not corrupted."
@@ -487,7 +452,6 @@ class EquivariantDataset(Dataset):
             img_a = _cached_read_image(img_a_path)
             img_b = _cached_read_image(img_b_path)
         else:
-            # Eliminating double conversion since the pipeline now correctly persists matrices in RGB natively
             img_a = item["img_a"]
             img_b = item["img_b"]
             
@@ -668,7 +632,6 @@ def train_sequence_loop(
                 else:
                     pred_pose = outputs
                 
-                # FIX: Network learns the residual directly. Supervise the prediction against the actual tangent space delta.
                 target_delta = xi_gt - xi_noisy
                 loss = torch.mean((pred_pose - target_delta) ** 2)
                 loss.backward()
@@ -707,7 +670,6 @@ def train_sequence_loop(
                         else:
                             pred_pose = outputs
                             
-                        # FIX: Validation metric should correspond to the semantic representation in training (the delta)
                         target_delta = xi_gt - xi_noisy
                         diff = pred_pose - target_delta
                         batch_loss = torch.mean(diff ** 2).item()
@@ -717,16 +679,12 @@ def train_sequence_loop(
                         
                 avg_val_loss = val_loss_accum / max(1, len(val_loader))
 
-            # ===== CORE TRAINING LOGIC FINALIZATION =====
             current_metric = avg_val_loss if val_loader is not None else avg_train_loss
             
-            # Step the learning rate scheduler
             scheduler.step(current_metric)
             
-            # Save normal epoch checkpoint
             save_checkpoint(epoch)
-            
-            # Assess metrics for best model caching and early stopping
+
             if current_metric < best_val_loss:
                 best_val_loss = current_metric
                 patience_counter = 0

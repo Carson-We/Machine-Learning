@@ -31,10 +31,6 @@ import multiprocessing as mp
 logger = logging.getLogger("LEPAUTE.Pipeline")
 
 class GracefulShutdownHandler:
-    """
-    Listens for OS-level termination signals to trigger safe pipeline teardown,
-    preventing SQLite database corruption and orphaned background threads.
-    """
     def __init__(self):
         self.shutdown_requested = False
         self.sigint_count = 0
@@ -42,7 +38,6 @@ class GracefulShutdownHandler:
             signal.signal(signal.SIGINT, self._signal_handler)
             signal.signal(signal.SIGTERM, self._signal_handler)
         except ValueError:
-            # Safely bypass if instantiated outside the main thread
             pass
 
     def _signal_handler(self, sig, frame):
@@ -51,25 +46,16 @@ class GracefulShutdownHandler:
         if self.sigint_count == 1:
             logger.info(f"[Shutdown] Received termination signal ({sig}). Initiating graceful shutdown sequence...")
             self.shutdown_requested = True
-            # CRITICAL FIX: Explicitly raise KeyboardInterrupt to break the main thread out of Python loops
             raise KeyboardInterrupt
             
         elif self.sigint_count == 2:
             logger.warning("[Shutdown] Graceful shutdown already in progress. The process might be blocked inside a C++ extension (e.g., PyTorch Compilation). Press Ctrl+C again to force abort.")
             
         else:
-            # CRITICAL FIX: If the user presses Ctrl+C 3+ times, the system is deadlocked in C++ and ignoring Python exceptions. 
-            # We must use os._exit to immediately terminate the process natively and bypass all Python runtime locks.
             logger.critical("[Shutdown] Multiple termination signals received. Process is deadlocked. Hard aborting via os._exit(130).")
             os._exit(130)
 
 class InferenceWorker:
-    """
-    Background Inference Process Manager.
-    Delegates heavy YOLO classification and PyTorch SE(3) Refiner models into a fully 
-    isolated operating system process to completely bypass the Python GIL, 
-    unblocking the high-frequency dense direct tracking loop on the main thread.
-    """
     def __init__(self, config, model_path: str):
         self.config = config
         self.model_path = model_path
@@ -96,7 +82,6 @@ class InferenceWorker:
             daemon=True
         )
         
-        # Updated signature to track the extracted delta_scale parameter and the async tracker_xi_rel history
         self.history_buffer: Dict[int, Tuple[Tuple[str, float], np.ndarray, float, np.ndarray, float, np.ndarray]] = {}
         self.state_lock = threading.Lock()
         
@@ -120,12 +105,7 @@ class InferenceWorker:
                 logger.warning(f"[InferenceWorker] Job queue full. Silently dropped {self.drop_count} frames so far to maintain system real-time throughput.")
 
     def get_latest_resolved_state(self, current_time: float) -> Optional[Tuple[Tuple[str, float], np.ndarray, float, np.ndarray, np.ndarray]]:
-        """
-        Retrieves the most recent asynchronous inference resolution from the separate process,
-        updating local history buffering without blocking the main tracker.
-        """
         with self.state_lock:
-            # Drain IPC result queue to sync state
             while not self.result_queue.empty():
                 try:
                     res = self.result_queue.get_nowait()
@@ -134,7 +114,6 @@ class InferenceWorker:
                 except queue.Empty:
                     break
                     
-            # Expire old states (index 4 is completion_time)
             current_keys = list(self.history_buffer.keys())
             for k in current_keys:
                 if current_time - self.history_buffer[k][4] > 5.0:
@@ -145,20 +124,17 @@ class InferenceWorker:
                 
             latest_resolved_id = max(self.history_buffer.keys())
             state = self.history_buffer.pop(latest_resolved_id)
-            
-            # Clean up older obsolete states to prevent memory leaks
+
             obsolete_keys = [k for k in list(self.history_buffer.keys()) if k <= latest_resolved_id]
             for k in obsolete_keys:
                 self.history_buffer.pop(k, None)
                 
-            # Returns: (obj_name, conf), refined_xi_rel, delta_scale, uncertainty, async_tracker_xi_rel
             return state[0], state[1], state[2], state[3], state[5]
 
     def stop(self):
             logger.info("[InferenceWorker] Stop command received. Halting background process...")
             self.running_event.clear()
             
-            # Flush the job queue to release potential blocked locks
             while not self.job_queue.empty():
                 try:
                     self.job_queue.get_nowait()
@@ -177,10 +153,6 @@ class InferenceWorker:
         
     @staticmethod
     def _run_process(config, model_path, job_queue, result_queue, running_event, heartbeat_value):
-        """
-        Independent Process Entrypoint.
-        Models are instantiated locally in this memory space to prevent serialization faults.
-        """
         
         import os, time, queue, torch
         from vision_tracking import YOLOClassifier
@@ -236,7 +208,6 @@ class InferenceWorker:
                 completion_time = time.time()
                 
                 try:
-                    # FIX: Relay the original historic tracker_xi_rel back to maintain SE(3) consistency 
                     result_queue.put_nowait((
                         frame_id, 
                         ((obj_name, conf), refined_xi_rel, delta_scale_val, uncertainty, completion_time, tracker_xi_rel)
@@ -251,7 +222,6 @@ class InferenceWorker:
                 continue
 
 def init_components(config, display_mode, save_json, mock):
-    """Initializes and returns all core execution components and threads."""
     shutdown_handler = GracefulShutdownHandler()
     
     min_frame_time = 0.0
@@ -282,12 +252,10 @@ def process_frame(
     worker, tracker, forecaster, T_global, 
     current_obj_name, latest_conf, latest_unc
 ):
-    """Processes a single frame boundary and returns updated trajectory state arrays."""
     logger.debug(f"[Pipeline] Frame ID {current_id} routed to main thread. Evaluating asynchronous inference state...")
     
     async_state = worker.get_latest_resolved_state(current_stamp)
     if async_state is not None:
-        # Destructure the historically aligned tracker parameter securely passed from the Async queue
         (obj_name, conf), refined_xi_rel, delta_scale_val, unc, async_tracker_xi_rel = async_state
         current_obj_name = obj_name 
         latest_conf = conf
@@ -308,9 +276,6 @@ def process_frame(
         worker.enqueue_job(current_id, prev_rgb, frame_rgb, tracker_xi_rel)
     
     if has_async:
-        # Strictly correct SE(3) composition of tracked prior and network residual delta
-        # FIX: Align the composition by using the specific historic `async_tracker_xi_rel` from the frame that spawned it, 
-        # avoiding catastrophic superposition errors onto the latest tracker frame.
         with mps_safe(config.device):
             T_tracker = se3_exp_map(torch.from_numpy(async_tracker_xi_rel).float().unsqueeze(0).to(config.device))
             T_delta = se3_exp_map(torch.from_numpy(refined_xi_rel).float().unsqueeze(0).to(config.device))
@@ -348,7 +313,6 @@ def process_frame(
         xi_global = T_global_log.squeeze(0).cpu().numpy()
         T_global_cpu = T_global.squeeze(0).cpu().numpy()
         
-    # Providing the true evaluated relative motion vector for manifold kinematics tracking
     forecaster.update_state(T_global_cpu, best_rel_xi, applied_scale, current_stamp, weight=0.5)
     
     return (
@@ -357,7 +321,6 @@ def process_frame(
     )
 
 def teardown(worker, collector, stream, display_mode, save_json):
-    """Executes safe pipeline termination and OS-level memory deallocation."""
     logger.info("[Teardown] === STARTING TEARDOWN SEQUENCE ===")
     logger.info("[Teardown] Halting InferenceWorker...")
     worker.stop()
@@ -556,7 +519,6 @@ if __name__ == "__main__":
         help="Select running mode: headless, gui (real-time window mode), json (data output mode), detailedgui (HUD + Trajectory map)"
     )
     
-    # New Performance profile flag argument
     parser.add_argument(
         "--perf",
         type=validate_performance_mode,
@@ -594,7 +556,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # FIX: args.mode is already evaluated to a DisplayMode Enum by argparse type validator
     selected_mode = args.mode
 
     config_kwargs = {}
@@ -603,7 +564,6 @@ if __name__ == "__main__":
         
     config = LepauteConfig(**config_kwargs)
     
-    # FIX: args.perf is already evaluated to a PerformanceMode Enum by argparse type validator
     config.performance_mode = args.perf
 
     selected_log_level = logging.DEBUG if args.log_level == "detailed" else logging.INFO

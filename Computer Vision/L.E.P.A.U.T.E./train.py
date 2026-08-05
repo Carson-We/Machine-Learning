@@ -28,7 +28,6 @@ logger = logging.getLogger("LEPAUTE.OfflineTraining")
 
 
 def set_reproducibility_seeds(seed: int = 42) -> None:
-    """Sets environment-wide seeds to guarantee exact reproducibility across runs."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -39,10 +38,6 @@ def set_reproducibility_seeds(seed: int = 42) -> None:
 
 
 def get_data_splits(dataset: Dataset, split_ratio: float = 0.2) -> Tuple[Dataset, Optional[Dataset]]:
-    """
-    Fallback mechanism: Partitions the continuous monocular tracking dataset into 
-    training and validation sets if explicit splits are not provided.
-    """
     dataset_size = len(dataset)
     if dataset_size < 8:
         logger.warning(
@@ -59,7 +54,6 @@ def get_data_splits(dataset: Dataset, split_ratio: float = 0.2) -> Tuple[Dataset
 
 
 def load_manifests_from_dir(json_dir: Path) -> List[Dict]:
-    """Securely parses individual JSON files from the designated directory into a collective dataset list."""
     records = []
     if not json_dir.is_dir():
         logger.error(f"Directory Error: Expected JSON directory not found at {json_dir}")
@@ -112,10 +106,8 @@ def main() -> None:
     
     args = parser.parse_args()
 
-    # 1. Enforce strict deterministic execution conditions
     set_reproducibility_seeds(args.seed)
 
-    # 2. Validation and path configuration boundaries
     data_root = Path(args.dataset_dir)
     ckpt_root = Path(args.checkpoint_dir)
 
@@ -130,7 +122,6 @@ def main() -> None:
     
     if latest_ckpt_path.exists():
         if args.resume_mode == "ask":
-            # CRITICAL FIX: Safe headless TTY check for interactive prompt to prevent sys.stdin freeze/crashes in CI/CD and Headless instances
             if sys.stdin.isatty():
                 try:
                     choice = input("\n[Progress Prompt] Detected previous training progress snapshot (latest_checkpoint.pth).\nDo you want to resume training from the last checkpoint? [Y/n]: ").strip().lower()
@@ -156,7 +147,6 @@ def main() -> None:
         logger.info("No previous training checkpoints detected. Automatically initiating a completely new optimization pipeline.")
         resume_flag = False
 
-    # 3. Safe configuration initialization and injection
     config = LepauteConfig()
     
     if config.device == "mps":
@@ -170,7 +160,6 @@ def main() -> None:
 
     logger.info(f"LEPAUTE Engine Configuration Initialized. Targets: Device={config.device} | Compiler={config.use_compiler}")
 
-    # 4. Safe dataset ingest pipeline loading (Detecting Explicit vs Implicit Splits)
     train_dir = data_root / "train"
     test_dir = data_root / "test"
     
@@ -209,7 +198,6 @@ def main() -> None:
             
         train_set, val_set = get_data_splits(full_dataset)
 
-    # 5. Core Network Architecture Initialization
     logger.info("Instantiating Deep SE(3) Residual Refiner Subsystem architecture.")
     try:
         model = SE3ResidualRefiner(config=config)
@@ -217,11 +205,9 @@ def main() -> None:
         logger.error(f"Architecture Generation Error: Failed to construct neural network graph layout: {e}")
         sys.exit(1)
     
-    # 6. Secure Execution Optimization Pipeline
     logger.info(f"Optimization track initialized. Syncing checkpoints output path to: {ckpt_root.resolve()}")
     
     try:
-        # Avoid local import loops dynamically resolved during main thread init
         train_loss, val_loss = train_sequence_loop(
             model=model,
             train_dataset=train_set,

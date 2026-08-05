@@ -36,8 +36,6 @@ class MonocularSE3Warping(nn.Module):
         u_norm = (u_t / (W - 1)) * 2.0 - 1.0
         v_norm = (v_t / (H - 1)) * 2.0 - 1.0
         
-        # FIXED: dim=2 caused a corrupted (B, H, 2, W) shape when passed to view. 
-        # Using dim=-1 yields the correct (B, H, W, 2) shape natively for grid_sample.
         grid = torch.stack((u_norm, v_norm), dim=-1)
 
         warped_img = F.grid_sample(img, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
@@ -45,10 +43,6 @@ class MonocularSE3Warping(nn.Module):
         return warped_img, valid_mask
 
 class SE3CrossAttentionBlock(nn.Module):
-    """
-    Cross-Attention block to correlate reference and current frame features.
-    Utilizes Pre-LayerNorm architecture for training stability.
-    """
     def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.1):
         super().__init__()
         self.num_heads = num_heads
@@ -75,14 +69,6 @@ class SE3CrossAttentionBlock(nn.Module):
         )
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            query: Features from reference image (B, N, C)
-            key: Features from current image (B, N, C)
-            value: Features from current image (B, N, C)
-        Returns:
-            Attended features (B, N, C)
-        """
         q = self.norm1_q(query)
         k = self.norm1_k(key)
         v = self.norm1_v(value)
@@ -94,24 +80,18 @@ class SE3CrossAttentionBlock(nn.Module):
         return x
 
 class SE3ResidualRefiner(nn.Module):
-    """
-    Refines the initial SE(3) pose estimate and dynamically resolves monocular scale ambiguity.
-    Predicts the residual pose delta_xi, a scale correction factor delta_s, and their joint uncertainties.
-    """
     def __init__(self, config: LepauteConfig, feature_dim: int = 256, max_resolution: int = 64):
         super().__init__()
         self.config = config
         
-        # 1. Pre-trained Backbone (ResNet18)
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         self.backbone = nn.Sequential(
-            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool, # 1/4
-            resnet.layer1, # 1/4, 64 channels
-            resnet.layer2, # 1/8, 128 channels
-            resnet.layer3  # 1/16, 256 channels
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3
         )
         
-        # 2. Lightweight Monocular Depth Geometry Head
         self.depth_head = nn.Sequential(
             nn.Conv2d(feature_dim, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
@@ -120,20 +100,16 @@ class SE3ResidualRefiner(nn.Module):
             nn.Sigmoid()
         )
         
-        # 3. Positional Embedding
         self.pos_embed = nn.Parameter(torch.randn(1, feature_dim, max_resolution, max_resolution) * 0.02)
         
-        # 4. Pose Conditioning Embedding
         self.pose_emb = nn.Sequential(
             nn.Linear(6, 64),
             nn.GELU(),
             nn.Linear(64, feature_dim)
         )
         
-        # 5. Cross Attention Block
         self.cross_attn = SE3CrossAttentionBlock(dim=feature_dim, num_heads=8, dropout=0.1)
         
-        # 6. Joint Pose & Scale Regression Head
         self.head = nn.Sequential(
             nn.Conv2d(feature_dim * 2 + 1, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256),
@@ -150,10 +126,6 @@ class SE3ResidualRefiner(nn.Module):
         
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
-
-        # Removed internal sub-module torch.compile hooks. Partial module compilation can lead 
-        # to fragmented graph optimization and inconsistent fallback states. Standard graph 
-        # compilation is now orchestrated exclusively at the top-level outer loop.
         
         self.to(self.config.device)
 
@@ -177,17 +149,6 @@ class SE3ResidualRefiner(nn.Module):
         return self.load_state_dict(new_state_dict, strict=False)
 
     def forward(self, img_ref: torch.Tensor, img_cur: torch.Tensor, xi_init: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            img_ref: Reference image tensor (B, 3, H, W)
-            img_cur: Current image tensor (B, 3, H, W)
-            xi_init: Initial relative pose estimate in se(3) tangent space (B, 6)
-        Returns:
-            delta_xi: Residual se(3) tangent vector (B, 6)
-            delta_scale: Multiplicative scale correction factor (B, 1)
-            uncertainty_pose: Log variance of the pose prediction (B, 6)
-            uncertainty_scale: Log variance of the scale prediction (B, 1)
-        """
         is_unbatched = img_ref.dim() == 3
         if is_unbatched:
             img_ref = img_ref.unsqueeze(0)
@@ -196,32 +157,26 @@ class SE3ResidualRefiner(nn.Module):
             
         B = img_ref.shape[0]
         
-        # 1. Feature Extraction
-        f_ref = self.backbone(img_ref) # (B, 256, H/16, W/16)
+        f_ref = self.backbone(img_ref)
         f_cur = self.backbone(img_cur)
         
         _, C, H_f, W_f = f_ref.shape
         
-        # 2. Monocular Depth Estimation Guidance
-        depth_map = self.depth_head(f_cur) # (B, 1, H_f, W_f)
-        
-        # 3. Add Spatial Positional Embeddings
+        depth_map = self.depth_head(f_cur)
+
         pos = F.interpolate(self.pos_embed, size=(H_f, W_f), mode='bilinear', align_corners=False)
         f_ref = f_ref + pos
         f_cur = f_cur + pos
-        
-        # 4. Inject Pose Conditioning
+
         p_emb = self.pose_emb(xi_init).view(B, C, 1, 1).expand(-1, -1, H_f, W_f)
         f_cur = f_cur + p_emb
         
-        # 5. Spatial Sequence Attention
         f_ref_flat = f_ref.view(B, C, -1).permute(0, 2, 1)
         f_cur_flat = f_cur.view(B, C, -1).permute(0, 2, 1)
         f_attn_flat = self.cross_attn(query=f_ref_flat, key=f_cur_flat, value=f_cur_flat)
         f_attn = f_attn_flat.permute(0, 2, 1).view(B, C, H_f, W_f)
-        
-        # 6. Combined Geometric Regression
-        combined_feat = torch.cat([f_ref, f_attn, depth_map], dim=1) # (B, 513, H_f, W_f)
+
+        combined_feat = torch.cat([f_ref, f_attn, depth_map], dim=1)
         out = self.head(combined_feat)
         
         delta_xi = out[:, 0:6]

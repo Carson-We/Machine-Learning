@@ -13,10 +13,6 @@ from geometry import se3_exp_map, se3_log_map
 from ultralytics import YOLO
 
 class MonocularDirectTracker:
-    """
-    Monocular tracking system handling direct photometric alignment with dynamic scale adjustment 
-    and an intelligent feature-based ORB fallback mechanism.
-    """
     def __init__(self, config: LepauteConfig):
         self.config = config
         self.device = torch.device(config.device)
@@ -41,19 +37,11 @@ class MonocularDirectTracker:
         logger.info(f"[MonocularDirectTracker] PyTorch Accelerated Direct Tracker Online. Device: {self.device} | Levels={self.config.pyramid_levels}")
         
     def update_dynamic_scale(self, new_scale: float):
-        """
-        Callback interface to dynamically update the tracker's internal scale prior 
-        using closed-loop state estimation, eliminating static monocular drift.
-        """
         if new_scale > 0.001:
             self.dynamic_scale_prior = new_scale
             logger.info(f"[MonocularDirectTracker] Scale prior synchronized dynamically to: {new_scale:.4f}")
             
     def track_fallback_orb(self, current_img: np.ndarray) -> Tuple[np.ndarray, bool]:
-        """
-        Executes robust feature tracking when direct tracking fails.
-        Uses the dynamic_scale_prior to resolve translation scaling.
-        """
         if self.last_keyframe_img is None:
             self.last_keyframe_img = current_img
             kp, des = self.orb.detectAndCompute(current_img, None)
@@ -73,7 +61,6 @@ class MonocularDirectTracker:
         pts_ref = np.float32([kp_ref[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         pts_cur = np.float32([kp_cur[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
         
-        # Compute Essential Matrix using camera parameters
         E, mask = cv2.findEssentialMat(
             pts_cur, pts_ref, 
             cameraMatrix=self.intrinsic_matrix, 
@@ -86,16 +73,13 @@ class MonocularDirectTracker:
             return np.eye(4), False
             
         _, R, t, mask_pose = cv2.recoverPose(E, pts_cur, pts_ref, cameraMatrix=self.intrinsic_matrix, mask=mask)
-        
-        # Apply the dynamically adjusted scale prior to translation vector instead of a hardcoded constant
+
         t_scaled = t.flatten() * self.dynamic_scale_prior
         
-        # Build relative transformation matrix
         T_rel = np.eye(4)
         T_rel[0:3, 0:3] = R
         T_rel[0:3, 3] = t_scaled
         
-        # Update keyframe structures
         self.last_keyframe_img = current_img
         self.last_keyframe_features = (kp_cur, des_cur)
         
@@ -103,17 +87,12 @@ class MonocularDirectTracker:
 
     def _build_pyramid(self, img_tensor: torch.Tensor) -> List[torch.Tensor]:
         pyr = [img_tensor]
-        # CRITICAL FIX: Properly reference the injected configuration block
         for l in range(self.config.pyramid_levels - 1):
             down = F.interpolate(pyr[-1].unsqueeze(0).unsqueeze(0), scale_factor=0.5, mode='bilinear', align_corners=False)
             pyr.append(down.squeeze(0).squeeze(0))
         return pyr
 
     def track(self, img_a: np.ndarray, img_b: np.ndarray, scale_prior: float = 1.0) -> Tuple[np.ndarray, float]:
-        """
-        Executes dense direct photometric alignment using a coarse-to-fine spatial pyramid,
-        accelerated via PyTorch tensors, with dynamic fallback to ORB PnP tracking if photometric score is low.
-        """
         if img_a is None or img_b is None:
             return np.zeros(6, dtype=np.float32), 0.0
 
@@ -296,7 +275,6 @@ class MonocularDirectTracker:
         pts_a = np.float32([kp_a[m.queryIdx].pt for m in all_matches])
         pts_b = np.float32([kp_b[m.trainIdx].pt for m in all_matches])
         
-        # CRITICAL FIX: Utilize dynamically updated configuration bounds, preventing AttributeError.
         K = np.array([[self.config.fx, 0.0, self.config.cx], 
                       [0.0, self.config.fy, self.config.cy], 
                       [0.0, 0.0, 1.0]], dtype=np.float32)
@@ -318,10 +296,6 @@ class MonocularDirectTracker:
         return xi_out, 0.0
 
 class YOLOClassifier:
-    """
-    YOLO-based object classification and detection subsystem replacing SigLIP.
-    Maintains strict compatibility with the pipeline's inference worker interface.
-    """
     def __init__(self, config: LepauteConfig, model_name: str = "yolov8n.pt"):
         self.config = config
         self.device = torch.device(config.device)
@@ -370,28 +344,19 @@ class YOLOClassifier:
             return fallback_label, 0.0
         
 class ManifoldKinematicForecaster:
-    """
-    Kinematic State Estimator operating on the SE(3) x R manifold.
-    Tracks 3D pose and estimates metric scale explicitly in log-space to handle scale drift.
-    """
     def __init__(self, process_noise_pose: float = 1e-3, process_noise_scale: float = 1e-4):
         self.lock = threading.Lock()
         
-        # State tracking variables
-        self.current_pose = np.eye(4)       # SE(3) matrix representing global pose
-        self.twist_velocity = np.zeros(6)    # se(3) tangent space linear/angular velocity
-        self.log_scale = 0.0                # Logarithmic scale: sigma = ln(scale). Initial scale = 1.0
-        self.log_scale_velocity = 0.0       # Time derivative of log scale
+        self.current_pose = np.eye(4)
+        self.twist_velocity = np.zeros(6)
+        self.log_scale = 0.0
+        self.log_scale_velocity = 0.0
         
         self.last_timestamp = None
         self.q_pose = process_noise_pose
         self.q_scale = process_noise_scale
 
     def predict(self, timestamp: float) -> Tuple[np.ndarray, float]:
-        """
-        Predicts the SE(3) pose and metric scale at a future timestamp utilizing 
-        the kinematic velocity and log-scale derivative on the Lie manifold.
-        """
         with self.lock:
             if self.last_timestamp is None:
                 self.last_timestamp = timestamp
@@ -412,10 +377,6 @@ class ManifoldKinematicForecaster:
             return predicted_pose, predicted_scale
 
     def update_state(self, measured_pose: np.ndarray, delta_xi: np.ndarray, delta_scale: float, timestamp: float, weight: float = 0.7):
-        """
-        Updates the manifold kinematic state with measured pose, relative twist delta, and scale updates.
-        Employs adaptive sliding window noise estimation to prevent long-term tracking drift on SE(3) x R.
-        """
         with self.lock:
             if not hasattr(self, 'state_history'):
                 self.state_history = []
@@ -467,6 +428,5 @@ class ManifoldKinematicForecaster:
             self.last_timestamp = timestamp
             
     def get_scale(self) -> float:
-        """ Returns the current absolute metric scale factor """
         with self.lock:
             return float(np.exp(self.log_scale))

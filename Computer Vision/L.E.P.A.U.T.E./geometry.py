@@ -23,7 +23,6 @@ def _se3_log_map_impl(T: torch.Tensor) -> torch.Tensor:
     R, t = T[:, :3, :3], T[:, :3, 3]
     
     trace_R = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
-    # Removed 1e-7 clamp to properly identify boundaries up to exactly pi or 0
     cos_theta = torch.clamp((trace_R - 1.0) / 2.0, -1.0, 1.0)
     theta = torch.acos(cos_theta)
     
@@ -41,7 +40,6 @@ def _se3_log_map_impl(T: torch.Tensor) -> torch.Tensor:
     
     if mask_large.any():
         th = theta[mask_large].unsqueeze(-1)
-        # Safe sin calculation guaranteeing no div-by-zero since we are strictly away from 0 and pi
         sin_th = torch.sin(th)
         
         phi_l = (th / (2.0 * sin_th)) * phi_raw[mask_large]
@@ -69,7 +67,6 @@ def _se3_log_map_impl(T: torch.Tensor) -> torch.Tensor:
         R_pi = R[mask_pi]
         t_pi = t[mask_pi]
         
-        # Stable axis-angle near pi: R = I + 2 K^2 => (R + I)/2 = v v^T
         A = (R_pi + torch.eye(3, device=T.device, dtype=T.dtype).unsqueeze(0)) / 2.0
         diag_A = torch.diagonal(A, dim1=-2, dim2=-1)
         max_idx = torch.argmax(diag_A, dim=-1)
@@ -82,7 +79,6 @@ def _se3_log_map_impl(T: torch.Tensor) -> torch.Tensor:
         v = col / v_max.unsqueeze(-1) 
         v = v / torch.norm(v, dim=-1, keepdim=True)
         
-        # Resolve sign using the small skew components
         phi_raw_pi = phi_raw[mask_pi]
         sign_mask = torch.sum(v * phi_raw_pi, dim=-1) < 0
         v[sign_mask] = -v[sign_mask]
@@ -109,11 +105,9 @@ def _se3_exp_map_impl(xi: torch.Tensor) -> torch.Tensor:
     B = xi.shape[0]
     rho, phi = xi[:, :3], xi[:, 3:]
     theta_sq = torch.sum(phi**2, dim=1, keepdim=True)
-    # Ensure numerical stability prior to root to prevent NaN gradients
     theta = torch.sqrt(torch.clamp(theta_sq, min=1e-10))
     
     T = torch.eye(4, device=xi.device, dtype=xi.dtype).unsqueeze(0).repeat(B, 1, 1)
-    # CRITICAL FIX: Invoke internal _skew_symmetric_impl directly to avoid recursive deadlocks via public wrapper
     K = _skew_symmetric_impl(phi)
     K2 = torch.bmm(K, K)
     
