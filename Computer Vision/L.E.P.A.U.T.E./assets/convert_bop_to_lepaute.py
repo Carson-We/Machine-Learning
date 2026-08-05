@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+BOP to LEPAUTE Monocular Dataset Converter
+Production-ready version with progress monitoring, robust I/O, split-aware tree traversal,
+and explicit train/test dataset partitioning.
+"""
+
 import argparse
 import json
 import logging
@@ -19,6 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger("BOP_CONVERTER")
 
 def calculate_relative_pose(R_A: np.ndarray, t_A: np.ndarray, R_B: np.ndarray, t_B: np.ndarray) -> List[float]:
+    """Computes exact SE(3) Lie Algebra twist (xi) linking Pose A to Pose B."""
     R_A_T = R_A.T
     R_rel = R_B @ R_A_T
     t_rel = t_B - (R_rel @ t_A)
@@ -83,8 +91,10 @@ def process_scene_pair(
         return []
 
     uuid_a, uuid_b = uuid.uuid4().hex[:8], uuid.uuid4().hex[:8]
+    # Enforce strictly .jpg extension to match the target directory naming convention
     out_a, out_b = f"frame_{uuid_a}.jpg", f"frame_{uuid_b}.jpg"
     
+    # Safely transcode any image format (like BOP's native PNGs) into actual high-quality JPEGs
     img_a = cv2.imread(str(rgb_a_path))
     img_b = cv2.imread(str(rgb_b_path))
     
@@ -95,6 +105,7 @@ def process_scene_pair(
     cv2.imwrite(str(out_dir / out_b), img_b, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     records = []
+    # Safeguard against zero division if translation_scale is improperly configured
     safe_scale = translation_scale if translation_scale != 0 else 1.0
 
     for obj_id in common_objs:
@@ -150,6 +161,7 @@ def run_conversion(
 ):
     bop_path, out_path = Path(bop_dir), Path(output_dir)
 
+    # Robust multi-level scene discovery targeting scene_gt.json boundaries
     scene_dirs = []
     if splits:
         for split_name in splits:
@@ -163,6 +175,7 @@ def run_conversion(
         logger.info(f"No specific splits provided. Deep scanning entire structure: {bop_path}")
         scene_dirs = [p.parent for p in bop_path.rglob("scene_gt.json")]
 
+    # Deduplicate in case of symlinks
     scene_dirs = sorted(list(set(scene_dirs)))
     logger.info(f"Discovered {len(scene_dirs)} valid BOP scenes for processing.")
 
@@ -170,8 +183,10 @@ def run_conversion(
         logger.error("No valid BOP scenes found. Please verify the dataset path and splits.")
         sys.exit(1)
 
+    # Categorize scenes into Train and Test splits based on directory nomenclature
     categorized_scenes = {"train": [], "test": []}
     for scene in scene_dirs:
+        # Check parent directories for testing/validation keywords
         path_parts = [p.name.lower() for p in scene.parents] + [scene.name.lower()]
         if any("test" in part or "val" in part for part in path_parts):
             categorized_scenes["test"].append(scene)
@@ -185,6 +200,7 @@ def run_conversion(
             
         logger.info(f"Initiating processing for '{category}' split ({len(scenes)} scenes)...")
         
+        # Output directory is now directly the category (train/ or test/) with no sub-folders
         category_out_path = out_path / category
         category_out_path.mkdir(parents=True, exist_ok=True)
         
@@ -202,6 +218,7 @@ def run_conversion(
                 except Exception as e:
                     logger.error(f"Process pipeline collapsed for a scene in '{category}' split: {e}")
 
+        # DECENTRALIZED JSON ARCHITECTURE: Save 1 JSON per image/record directly next to the images
         for record in tqdm(all_records, desc=f"Generating JSON metadata for {category.capitalize()}"):
             frame_a_stem = Path(record["frame_a"]).stem
             obj_str = record["detected_object"]

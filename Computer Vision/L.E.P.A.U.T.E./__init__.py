@@ -1,24 +1,30 @@
 from main import run_pipeline
-
-from module import (
-    LepauteConfig,
-    DisplayMode,
-    PerformanceMode,
+from geometry import (
     skew_symmetric,
     se3_exp_map,
     se3_log_map,
     compose_poses,
-    CameraIOStream,
+)
+from vision_tracking import (
     MonocularDirectTracker,
-    SigLIPClassifier,
+    YOLOClassifier,
+    ManifoldKinematicForecaster,
+)
+from models import (
     SE3ResidualRefiner,
     MonocularSE3Warping,
     SE3CrossAttentionBlock,
+)
+from globals import logger, mps_safe
+from pipeline_and_config import (
+    LepauteConfig,
+    DisplayMode,
+    PerformanceMode,
     EquivariantDataset,
-    ManifoldKinematicForecaster,
     SequenceDataCollector,
     train_sequence_loop,
     load_data,
+    CameraIOStream,
 )
 
 __all__ = [
@@ -32,7 +38,7 @@ __all__ = [
     "compose_poses",
     "CameraIOStream",
     "MonocularDirectTracker",
-    "SigLIPClassifier",
+    "YOLOClassifier",
     "SE3ResidualRefiner",
     "MonocularSE3Warping",
     "SE3CrossAttentionBlock",

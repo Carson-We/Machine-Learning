@@ -1,31 +1,54 @@
 import os
-import unittest
-import tempfile
+import time
 import json
 import sqlite3
-from unittest.mock import patch, MagicMock
+import tempfile
+import unittest
 from collections import deque
+from unittest.mock import patch, MagicMock
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-import cv2
-
-from module import (
-    LepauteConfig, DisplayMode, PerformanceMode,
-    skew_symmetric, se3_exp_map, se3_log_map, compose_poses,
-    MonocularDirectTracker, SigLIPClassifier, MonocularSE3Warping,
-    SE3CrossAttentionBlock, SE3ResidualRefiner, CameraIOStream,
-    SequenceDataCollector, EquivariantDataset, ManifoldKinematicForecaster,
-    train_sequence_loop, load_data
+from geometry import (
+    skew_symmetric,
+    se3_exp_map,
+    se3_log_map,
+    compose_poses,
 )
+from vision_tracking import (
+    MonocularDirectTracker,
+    YOLOClassifier,
+    ManifoldKinematicForecaster,
+)
+from models import (
+    SE3ResidualRefiner,
+    MonocularSE3Warping,
+    SE3CrossAttentionBlock,
+)
+from globals import logger, _mps_lock
+from pipeline_and_config import (
+    LepauteConfig,
+    DisplayMode,
+    PerformanceMode,
+    EquivariantDataset,
+    SequenceDataCollector,
+    train_sequence_loop,
+    load_data,
+    CameraIOStream,
+)
+from main import run_pipeline
 
-import time
 
 class TestLepauteCoreArchitecture(unittest.TestCase):
     def setUp(self):
+        """
+        Sets up a clean, isolated temporary workspace and micro-scale 
+        configurations optimized for high-performance deterministic unit testing.
+        """
         self.test_dir = tempfile.TemporaryDirectory()
         self.config = LepauteConfig(
             device="cpu",
@@ -42,33 +65,65 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         )
 
     def tearDown(self):
+        """
+        Safely tears down the isolated temporary file environment.
+        """
         self.test_dir.cleanup()
 
     def test_skew_symmetric_properties(self):
+        """
+        Validates the mathematical properties of the skew-symmetric matrix operator,
+        ensuring that K^T = -K holds true for random input vectors.
+        """
         v = torch.tensor([[1.5, -2.3, 4.1]], dtype=torch.float32)
         K = skew_symmetric(v)
         
         self.assertEqual(K.shape, (1, 3, 3))
+        # Skew-symmetric definition: K + K^T = 0
         self.assertTrue(torch.allclose(K, -K.transpose(1, 2), atol=1e-6))
 
     def test_se3_manifold_invariants(self):
+        """
+        Verifies exponential and logarithmic mapping bounds over Lie groups SE(3)
+        for identity limits, Taylor expansions, large closed-form rotation angles,
+        and newly introduced pi-angle and small-angle edge cases.
+        """
+        # 1. Identity Verification
         zero_xi = torch.zeros(1, 6, dtype=torch.float32)
         T_identity = se3_exp_map(zero_xi)
         self.assertTrue(torch.allclose(T_identity[:, :3, :3], torch.eye(3).unsqueeze(0)))
         self.assertTrue(torch.allclose(T_identity[:, :3, 3], torch.zeros(1, 3)))
-    
+        
+        # 2. Small Angle Bounds (Taylor series verification branch)
         small_xi = torch.tensor([[1e-5, -2e-5, 1e-5, 3e-5, -1e-5, 2e-5]], dtype=torch.float32)
         T_small = se3_exp_map(small_xi)
         recovered_small_xi = se3_log_map(T_small)
         self.assertTrue(torch.allclose(small_xi, recovered_small_xi, atol=1e-5))
 
+        # 3. Large Rotation Angle Bounds (Analytical trigonometric branch)
         large_xi = torch.tensor([[0.2, -0.1, 0.5, 0.1, -0.2, 0.3]], dtype=torch.float32)
         T_large = se3_exp_map(large_xi)
         recovered_large_xi = se3_log_map(T_large)
         self.assertTrue(torch.allclose(large_xi, recovered_large_xi, atol=1e-4))
+        
+        # 4. Tiny Angle Bounds (Coverage for 1e-6 to 1e-3 interval)
+        tiny_xi = torch.tensor([[5e-6, -2e-5, 8e-6, 5e-4, -7e-4, 1e-4]], dtype=torch.float32)
+        T_tiny = se3_exp_map(tiny_xi)
+        recovered_tiny_xi = se3_log_map(T_tiny)
+        self.assertTrue(torch.allclose(tiny_xi, recovered_tiny_xi, atol=1e-6))
+        
+        # 5. Pi Angle Bounds (Coverage for theta ~ pi)
+        # Construct an exact pi rotation around X axis
+        pi_xi = torch.tensor([[0.1, -0.2, 0.3, 3.14159, 0.0, 0.0]], dtype=torch.float32)
+        T_pi = se3_exp_map(pi_xi)
+        recovered_pi_xi = se3_log_map(T_pi)
+        self.assertFalse(torch.isnan(recovered_pi_xi).any())
+        self.assertTrue(torch.allclose(pi_xi[:3], recovered_pi_xi[:3], atol=1e-3))
 
     def test_compose_poses(self):
-
+        """
+        Validates 3D spatial coordinate pose composition transformations.
+        """
         T1 = se3_exp_map(torch.tensor([[0.1, 0.0, 0.0, 0.0, 0.1, 0.0]], dtype=torch.float32))
         T2 = se3_exp_map(torch.tensor([[0.0, 0.2, 0.0, 0.0, 0.0, 0.2]], dtype=torch.float32))
         
@@ -76,7 +131,12 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertEqual(T_composed.shape, (1, 4, 4))
 
     def test_gauss_newton_pyramid_stability_with_scale(self):
+        """
+        Tests direct photometric tracking on image pyramids, aligning method 
+        signatures and asserting convergence vectors on static identical scenes.
+        """
         tracker = MonocularDirectTracker(self.config)
+        # Create structured non-zero gradient texture canvas
         img1 = np.ones((64, 64, 3), dtype=np.uint8) * 128
         cv2.circle(img1, (32, 32), 16, (64, 64, 64), -1)
         
@@ -88,14 +148,20 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertTrue(0.0 <= score <= 1.0)
 
     def test_hybrid_orb_fallback_execution(self):
+        """
+        Generates distinct high-contrast geometric feature patterns to thoroughly
+        exercise the backup ORB and RANSAC PnP tracking loop without short-circuiting.
+        """
         self.config.enable_orb_fallback = True
         tracker = MonocularDirectTracker(self.config)
         
+        # Construct geometric reference frame A
         img_a = np.zeros((64, 64, 3), dtype=np.uint8)
         cv2.rectangle(img_a, (10, 10), (25, 25), (255, 255, 255), -1)
         cv2.circle(img_a, (45, 45), 10, (255, 255, 255), -1)
         cv2.line(img_a, (5, 50), (25, 55), (255, 255, 255), 2)
         
+        # Construct shifted target frame B
         img_b = np.zeros((64, 64, 3), dtype=np.uint8)
         cv2.rectangle(img_b, (12, 10), (27, 25), (255, 255, 255), -1)
         cv2.circle(img_b, (47, 45), 10, (255, 255, 255), -1)
@@ -105,27 +171,50 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertEqual(xi.shape, (6, ))
         self.assertTrue(0.0 <= score <= 1.0)
 
-    @patch('module.SiglipModel.from_pretrained')
-    @patch('module.SiglipProcessor.from_pretrained')
-    def test_siglip_classifier_mocked_inference(self, mock_proc_init, mock_model_init):
-        mock_processor = MagicMock()
+    @patch('vision_tracking.YOLO')
+    def test_yolo_classifier_mocked_inference(self, mock_yolo_init):
+        """
+        Mocks network-dependent YOLO layers to validate 
+        predictive routing and probability extraction distribution safely,
+        syncing tests with the updated inference architecture utilizing object detection (.boxes).
+        """
         mock_model = MagicMock()
+        # Ultralytics models store class mapping directly in the model attributes
+        mock_model.names = {0: 'table', 1: 'cup'}
+        mock_yolo_init.return_value = mock_model
         
-        mock_proc_init.return_value = mock_processor
-        mock_model_init.return_value = mock_model
+        # Configure output mock structure mapping to ultralytics YOLO Results API
+        mock_result = MagicMock()
+        mock_result.names = {0: 'table', 1: 'cup'}
         
-        mock_outputs = MagicMock()
-        mock_outputs.logits_per_image = torch.tensor([[12.0, 1.5, 0.5, 2.0, 1.0, 0.2]])
-        mock_model.return_value = mock_outputs
+        # Explicitly set probs to None to ensure the pipeline falls through to detection (.boxes)
+        mock_result.probs = None
         
-        classifier = SigLIPClassifier(self.config)
+        # Mock boxes object mimicking Ultralytics .boxes detection API
+        mock_boxes = MagicMock()
+        # Simulate multiple detections: index 0 (cup) at 85%, index 1 (table) at 95%
+        mock_boxes.conf = torch.tensor([0.85, 0.95])
+        mock_boxes.cls = torch.tensor([1.0, 0.0]) 
+        # Support length evaluation for `len(res.boxes) > 0` validation checks
+        mock_boxes.__len__.return_value = 2
+        
+        mock_result.boxes = mock_boxes
+        mock_model.return_value = [mock_result]
+        
+        # Test updated YOLO integration strictly checking detection outputs
+        classifier = YOLOClassifier(self.config)
         dummy_img = np.zeros((64, 64, 3), dtype=np.uint8)
         
         label, score = classifier.predict(dummy_img)
+        
+        # Assert the model successfully parses the highest confidence bounding box
         self.assertEqual(label, "table")
-        self.assertGreater(score, 0.9)
+        self.assertAlmostEqual(score, 0.95, places=5)
 
     def test_monocular_se3_warping(self):
+        """
+        Tests backward differentiable warping grid samplers for perspective projections.
+        """
         warper = MonocularSE3Warping(self.config)
         img_tensor = torch.rand(2, 3, 64, 64, dtype=torch.float32)
         xi_tensor = torch.zeros(2, 6, dtype=torch.float32)
@@ -136,13 +225,20 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertEqual(valid_mask.shape, (2, 1, 64, 64))
 
     def test_se3_cross_attention_block(self):
+        """
+        Ensures cross-attention mechanism correctly handles spatial features.
+        Fixed to match the updated 3-argument signature (Q, K, V).
+        """
         block = SE3CrossAttentionBlock(dim=32, num_heads=2)
-        visual_feat_flat = torch.rand(2, 256, 32, dtype=torch.float32)
+        visual_feat_flat = torch.rand(2, 256, 32, dtype=torch.float32)  # (B, N, C)
         
         output = block(query=visual_feat_flat, key=visual_feat_flat, value=visual_feat_flat)
         self.assertEqual(output.shape, (2, 256, 32))
 
     def test_se3_residual_refiner_and_compilation_loading(self):
+        """
+        Tests forward tensor dimensions for the newly expanded 14-dim regression head.
+        """
         refiner = SE3ResidualRefiner(config=self.config, feature_dim=256, max_resolution=64)
         img_a = torch.rand(2, 3, 64, 64, dtype=torch.float32)
         img_b = torch.rand(2, 3, 64, 64, dtype=torch.float32)
@@ -161,6 +257,9 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertIsNotNone(load_status)
 
     def test_camera_io_stream_mock(self):
+        """
+        Asserts dimensional invariants under synthetic framework generation.
+        """
         stream = CameraIOStream(self.config, mock=True)
         ret, frame, meta = stream.read()
         
@@ -171,6 +270,9 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         stream.release()
 
     def test_concurrent_collector_schema(self):
+        """
+        Validates safe extraction and operational correctness of background logging streams.
+        """
         collector = SequenceDataCollector(config=self.config)
         collector.start()
         
@@ -186,6 +288,9 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertEqual(len(loaded[0]["lie_params"]), 6)
 
     def test_equivariant_dataset_initialization(self):
+        """
+        Validates data augmentation mappings and formatting transformations.
+        """
         img = np.zeros((64, 64, 3), dtype=np.uint8)
         mock_data = [{
             "img_a": img, 
@@ -204,6 +309,9 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertIsInstance(scale_prior, float)
 
     def test_manifold_kinematic_forecaster(self):
+        """
+        Validates continuous prediction updates via manifold state tracking.
+        """
         forecaster = ManifoldKinematicForecaster()
         measured_pose = np.eye(4)
         delta_xi = np.zeros(6, dtype=np.float32)
@@ -217,6 +325,10 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
         self.assertGreater(predicted_scale, 1.0)
 
     def test_train_sequence_loop_execution(self):
+        """
+        Executes a complete training epoch utilizing a cross-platform safe single-process 
+        dataloader wrapper to verify error handling and stable loss minimization.
+        """
         img = np.zeros((64, 64, 3), dtype=np.uint8)
         mock_data = [
             {"img_a": img, "img_b": img, "lie_params": [0.0]*6, "detected_object": "mouse"},
@@ -247,14 +359,16 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
             
             self.assertIsInstance(train_loss, float)
             self.assertIsInstance(val_loss, float)
-            
+
     def test_integration_moving_sequence(self):
+        """Simulates a real video sequence integration test using synthetic shapes moving systematically."""
         tracker = MonocularDirectTracker(self.config)
         
         base_img = np.zeros((64, 64, 3), dtype=np.uint8)
         frames = []
         for i in range(5):
             img = base_img.copy()
+            # Object moving right (translation)
             cv2.rectangle(img, (20 + i*2, 20), (40 + i*2, 40), (255, 255, 255), -1)
             frames.append(img)
             
@@ -263,33 +377,40 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
             xi, score = tracker.track(frames[i-1], frames[i], scale_prior=1.0)
             cumulative_xi += xi
             
+        # Due to direct photometric alignment, we expect translational shifts to be aggregated
         self.assertNotEqual(cumulative_xi[0], 0.0)
 
     @patch('main.cv2.imshow')
     @patch('main.cv2.waitKey', return_value=-1)
     def test_benchmark_performance_modes(self, mock_wait, mock_imshow):
-        from main import run_pipeline
+        """Evaluates computational constraints applied by different PerformanceModes."""
         
+        # Test LOW Profile (Frame skipping and sleep overhead)
         self.config.performance_mode = PerformanceMode.LOW
         start_low = time.time()
         res_low = run_pipeline(self.config, display_mode=DisplayMode.HEADLESS, unlimited=False, save_json=False, mock=True)
         time_low = time.time() - start_low
         
+        # Test HIGH Profile (Uncapped processing)
         self.config.performance_mode = PerformanceMode.HIGH
         start_high = time.time()
         res_high = run_pipeline(self.config, display_mode=DisplayMode.HEADLESS, unlimited=False, save_json=False, mock=True)
         time_high = time.time() - start_high
         
+        # Both should execute without failure returning payload metadata
         self.assertTrue(len(res_low) > 0)
         self.assertTrue(len(res_high) > 0)
         
+        # Low mode strictly enforces sleep throttling to conserve resources
         self.assertGreater(time_low, time_high)
 
     def test_long_duration_drift(self):
+        """Tests system stability over a long sequence to ensure no exponential mathematical drift."""
         forecaster = ManifoldKinematicForecaster()
         
         current_pose = np.eye(4)
         for i in range(100):
+            # Inject normally distributed micro-noise centering on 0 to test stability
             noisy_delta_xi = np.random.normal(0, 1e-4, 6).astype(np.float32)
             noisy_delta_scale = max(0.99, min(1.01, 1.0 + np.random.normal(0, 1e-4)))
             
@@ -306,8 +427,10 @@ class TestLepauteCoreArchitecture(unittest.TestCase):
             
         final_xi = se3_log_map(torch.from_numpy(current_pose).unsqueeze(0).float())
         
+        # Assert the state filter prevents exponential divergence
         self.assertTrue(torch.all(torch.abs(final_xi) < 0.1).item())
         self.assertAlmostEqual(forecaster.get_scale(), 1.0, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()

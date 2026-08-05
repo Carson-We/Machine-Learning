@@ -1,100 +1,125 @@
-# L.E.P.A.U.T.E. Usage Guide
+# Usage Guide
 
-This document provides the standard operating procedures for executing the Lie Equivariant Perception Algebraic Unified Transform Embedding (L.E.P.A.U.T.E.) Framework. All execution wrapper shell scripts (`.sh`) have been deprecated and removed; the system is now invoked directly via Python.
+## 1. Overview
 
-## 1. Dataset Preparation
+The L.E.P.A.U.T.E. Framework provides a monocular SE(3) perception pipeline for real-time camera ego-motion estimation, object classification, and relative pose tracking. All entry points are invoked directly through Python. Configuration is managed via `LepauteConfig`, optional external JSON files for camera intrinsics and object scale priors, and command-line arguments.
 
-The dataset pipeline requires downloading the BOP benchmark data and converting it into the framework's monocular dataset format.
+Core entry points:
+- `main.py` — online perception pipeline
+- `train.py` — offline training of the SE(3) Residual Refiner
+- `convert_bop_to_lepaute.py` — BOP dataset conversion
+- Programmatic API via `run_pipeline` and `LepauteConfig`
 
-1. **Download the Data**: Fetch the YCB-V dataset from the Hugging Face BOP benchmark.
+## 2. Install Requirements
+
+Install dependencies from the provided requirements file:
+
+```bash
+pip install -r requirements.txt
+```
+
+Ensure a compatible PyTorch installation matching your hardware (CUDA, MPS, or CPU). YOLO weights (`yolov8n.pt`) are downloaded automatically on first use by Ultralytics.
+
+## Dataset Preparation
+
+A pre-converted LEPAUTE dataset is available at:
+
+[https://huggingface.co/datasets/dev1virtuoso/lepaute-dataset](dev1virtuoso/lepaute-dataset)
+
+Alternatively, prepare the dataset from the original BOP source:
+
+1. Download the YCB-V dataset from the Hugging Face BOP benchmark:
 
 ```bash
 python ycb-v_download.py
 ```
 
-2. **Extract Archives**: Extract the downloaded `.zip` files located in the `./bop_datasets/ycbv` directory before running the converter.
+2. Extract the downloaded `.zip` files located under `./bop_datasets/ycbv`.
 
-3. **Convert Dataset**: Format the data to calculate exact SE(3) relative poses across specified splits.
+3. Convert the extracted data into the monocular LEPAUTE format (computes exact SE(3) relative poses):
 
 ```bash
-python convert_bop_to_lepaute.py --bop_dir ./dataset/bop_datasets/ycbv --output_dir ./dataset/lepaute_dataset --splits train_pbr train_real --stride 1 --workers 8
+python convert_bop_to_lepaute.py \
+  --bop_dir ./dataset/bop_datasets/ycbv \
+  --output_dir ./dataset/lepaute_dataset \
+  --splits train_pbr train_real \
+  --stride 1 \
+  --workers 8
 ```
 
-### Dataset Conversion Arguments (`convert_bop_to_lepaute.py`)
+### Conversion Arguments
 
-* **`--bop_dir`**: The local file reference source folder mapping where downloaded data is hosted (Required).
-* **`--output_dir`**: The target directory destination for exporting formatted assets (Default: `./lepaute_dataset`).
-* **`--splits`**: Specifies space-separated target dataset splits to filter and process.
-* **`--stride`**: Sets the index jumping frame interval frequency gap (Default: `1`).
-* **`--obj_ids`**: Enumerated whitespace-separated mask array to target specific objects (e.g., `--obj_ids 1 5 12`).
-* **`--workers`**: Count of parallel processing worker threads (Default: `4`).
-* **`--scale`**: Geometric division normalization scaling coefficient (Default: `1000.0`).
+| Argument | Default | Description |
+|---|---|---|
+| `--bop_dir` | Required | Path to the downloaded BOP dataset root |
+| `--output_dir` | `./lepaute_dataset` | Destination for converted assets |
+| `--splits` | None | Space-separated splits to process (e.g. `train_pbr train_real`) |
+| `--stride` | `1` | Frame interval for relative-pose pair generation |
+| `--obj_ids` | None | Optional whitespace-separated object IDs to keep |
+| `--workers` | `4` | Parallel worker count |
+| `--scale` | `1000.0` | Translation normalization factor |
 
-## 2. Model Training
+## Model Training
 
-Once the dataset is compiled and the database log manifest is generated, initiate the offline training sequence for the Deep SE(3) Residual Refiner Subsystem.
+After obtaining or converting the dataset, train the SE(3) Residual Refiner:
 
 ```bash
-python train.py --dataset_dir ./dataset/lepaute_dataset --manifest_name lepaute_data.json --checkpoint_dir ./checkpoints --epochs 50 --seed 42
+python train.py \
+  --dataset_dir ./dataset/lepaute_dataset \
+  --checkpoint_dir ./checkpoints \
+  --epochs 50 \
+  --seed 42
 ```
 
-### Training Arguments (`train.py`)
+### Training Arguments
 
-* **`--dataset_dir`**: Target filesystem path containing the database log manifest and images (Required).
-* **`--manifest_name`**: File name of the database log manifest JSON.
-* **`--epochs`**: Maximum duration boundary for training iterations (Default: `15`).
-* **`--checkpoint_dir`**: Destination folder for optimized weights (Default: `./checkpoints`).
-* **`--device`**: Manually forces device routing targeting (e.g., `cuda`, `mps`, `cpu`).
-* **`--no_compile`**: Prevents the backend from running PyTorch 2.x ahead-of-time compilation optimizations.
-* **`--seed`**: Sets the random seed base for deterministic consistency (Default: `42`).
-* **`--resume_mode`**: Specifies checkpoint state restoration behavior (e.g., `ask`).
+| Argument | Default | Description |
+|---|---|---|
+| `--dataset_dir` | Required | Root containing train/test manifests and images |
+| `--epochs` | `15` | Maximum training epochs |
+| `--checkpoint_dir` | `./checkpoints` | Directory for weight checkpoints |
+| `--device` | None | Force device (`cuda`, `mps`, or `cpu`) |
+| `--no_compile` | False | Disable `torch.compile` |
+| `--seed` | `42` | Random seed for reproducibility |
+| `--resume_mode` | `ask` | `resume`, `scratch`, or `ask` |
 
-## 3. Running the Main Pipeline
+The trainer automatically detects explicit `train/` and `test/` subdirectories or falls back to random splitting. Checkpoints are written as `latest_checkpoint.pth` and `best_model.pth`.
 
-The primary perception pipeline can be launched using the `main.py` entry point.
+## Running the Main Pipeline
 
-* **GUI Mode**: Standard real-time graphical interface.
+Launch the online perception system:
 
 ```bash
+# Standard GUI
 python main.py --mode gui --perf medium
-```
 
-* **Detailed GUI Mode**: Advanced real-time HUD and live 2D trajectory map overlay.
-
-```bash
+# Detailed HUD + trajectory map
 python main.py --mode detailedgui --perf high
-```
 
-* **Headless Mode**: Background execution without rendering a visual display.
-
-```bash
+# Headless (no display)
 python main.py --mode headless --perf low
-```
 
-* **JSON Mode**: Outputs tracking and pose estimation results directly as structured metrics.
-
-
-```bash
+# Structured metric output only
 python main.py --mode json
 ```
 
-### Main Pipeline Arguments (`main.py`)
+### Main Pipeline Arguments
 
-* **`--mode`**: Selects the system execution display framework (`headless`, `gui`, `json`, or `detailedgui`).
-* **`--perf`**: Selects the operational performance profile orchestration layer (`low`, `medium`, or `high`).
-* **`--db`**: Explicitly sets a custom file path for the underlying local SQLite transition storage database.
-* **`--limit`**: An evaluation testing toggle that limits telemetry mapping execution to a ceiling of 50 total frames.
+| Argument | Default | Description |
+|---|---|---|
+| `--mode` | `gui` | `headless`, `gui`, `json`, or `detailedgui` |
+| `--perf` | `medium` | `low`, `medium`, or `high` (controls pyramid levels, Gauss-Newton iterations, and frame throttling) |
+| `--db` | None | Custom SQLite path for transition storage |
+| `--limit` | False | Cap execution at 50 frames (testing) |
+| `--log_level` | `general` | `general` (INFO) or `detailed` (DEBUG) |
+| `--no_save` | False | Disable SQLite persistence |
 
-## 4. Programmatic Integration
+## Programmatic Integration
 
-For embedding the SE(3) tracking and classification subsystems into custom robotics architectures, bypass the CLI and invoke the framework programmatically.
-
-Available imports from the core module include `LepauteConfig`, `DisplayMode`, `run_pipeline`, `MonocularDirectTracker`, `SigLIPClassifier`, and other Lie group algebraic mappings (`se3_exp_map`, `compose_poses`, etc.).
-
-**Example Implementation:**
+Bypass the CLI and embed the pipeline directly:
 
 ```python
-from module import LepauteConfig, DisplayMode
+from pipeline_and_config import LepauteConfig, DisplayMode
 from main import run_pipeline
 
 custom_config = LepauteConfig(
@@ -117,10 +142,89 @@ for payload in telemetry_results:
     print(f"Frame {payload['frame_id']} | Object: {payload['category']} | Pose: {payload['xi']}")
 ```
 
-## 5. High-Level Troubleshooting
+To inject custom video sources (ROS topics, RTSP, simulation buffers), subclass `CameraIOStream` and override `read()`. Frames must be returned as `(H, W, 3)` uint8 RGB arrays together with a metadata dictionary containing at least `timestamp` and `frame_id`.
 
-* **Thread Blocking in Asynchronous Architectures**: Avoid polling `get_latest_resolved_state()` with high-frequency blocking calls when integrating into external asynchronous frameworks. Ensure your main loop pulls states asynchronously to prevent stream starvation.
+## Parameters That Must Be Set Manually
 
-* **VRAM Leaks in Custom Loops**: If building custom loops outside of `main.py`, intermediate SE(3) tensors generated by Lie operations must be explicitly detached (`.detach().cpu().numpy()`) to prevent saturating GPU VRAM.
+Several values are environment- or hardware-specific and should be configured before production use.
 
-* **Concurrency Collisions on Apple Silicon (MPS)**: Heavy main-thread operations alongside isolated `InferenceWorker` threading can cause Metal command buffer crashes. Rely on the built-in CPU fallback or enforce strict threading locks (`_mps_lock`) around custom inference blocks.
+### Camera Intrinsics
+
+Defaults are loaded from `camera_config.json` (or environment variable `LEPAUTE_CAMERA_CONFIG_PATH`). If the file is absent, the following fallbacks are used:
+
+```json
+{
+  "fx": 250.0,
+  "fy": 250.0,
+  "cx": 160.0,
+  "cy": 120.0
+}
+```
+
+Override at construction time:
+
+```python
+config = LepauteConfig(fx=600.0, fy=600.0, cx=320.0, cy=240.0)
+```
+
+Incorrect intrinsics produce scale and pose drift.
+
+### Object Scale Priors
+
+Metric scale priors (meters) are loaded from `object_config.json` (or `LEPAUTE_OBJECT_CONFIG_PATH`). Default keys include:
+
+```json
+{
+  "table": 1.5,
+  "cup": 0.1,
+  "keyboard": 0.4,
+  "laptop": 0.35,
+  "mouse": 0.12,
+  "human": 1.7,
+  "background": 2.0
+}
+```
+
+Add or edit entries to match the objects present in your scene. The classifier label is mapped directly to these priors for monocular depth projection.
+
+### Compute Device
+
+Automatically detected (`cuda` > `mps` > `cpu`). Force a specific device via:
+
+```python
+config = LepauteConfig(device="cuda")
+```
+
+or the CLI flag `--device`.
+
+### Performance Profile
+
+`--perf low|medium|high` adjusts pyramid levels, Gauss-Newton iteration count, and optional frame-rate throttling. Choose according to available compute and required latency.
+
+### Model Checkpoint Path
+
+The inference worker loads `./checkpoints/best_model.pth` by default. Ensure a trained checkpoint exists at this location, or the refiner falls back to random initialization.
+
+### SQLite Database Path
+
+Defaults to `lepaute_data.db`. Override with `--db` or `LepauteConfig(data_store=...)`.
+
+## 3. Troubleshooting
+
+**Thread blocking in asynchronous architectures**  
+Avoid high-frequency blocking polls of `get_latest_resolved_state()` inside `asyncio` or ROS spin loops. Pull the latest resolved state asynchronously relative to the worker queue to prevent stream starvation or UI lock-up.
+
+**VRAM leaks in custom execution loops**  
+When building loops outside `main.py`, detach intermediate SE(3) tensors produced by `se3_exp_map` and `se3_log_map` (`.detach().cpu().numpy()`) before storing or publishing them. Failure to detach retains the full computational graph and rapidly exhausts GPU memory.
+
+**Concurrency collisions on Apple Silicon (MPS)**  
+Heavy main-thread work concurrent with the isolated `InferenceWorker` process can trigger Metal command-buffer crashes. Prefer the built-in CPU fallback, or wrap custom inference blocks with the provided `_mps_lock` / `mps_safe` context manager when forcing MPS execution.
+
+**Camera acquisition failures**  
+The capture thread attempts multiple platform-specific backends (AVFoundation, DSHOW, MSMF, V4L2). If connection repeatedly fails, verify device permissions and that no other process holds exclusive access to the camera. Mock mode (`mock=True`) can be used for offline testing.
+
+**Empty or stalled job queue**  
+Under sustained high load the inference worker silently drops frames when the bounded queue (size 5) is full. Reduce input frame rate or lower the performance profile if drop counts become excessive.
+
+**Checkpoint loading shape mismatches**  
+When resuming training or loading a refined model, the `load_compiled_state_dict` method strips `_orig_mod.` prefixes and tolerates shape mismatches by falling back to fresh initialization for incompatible layers. Verify that the checkpoint was produced with the same `feature_dim` and `max_resolution` settings.
